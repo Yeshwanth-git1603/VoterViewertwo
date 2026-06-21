@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+<title>Voter Search</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#191c23; --card2:#21252e; --line:#2c313c;
+    --text:#e8eaed; --muted:#9aa3b2; --accent:#5b8cff; --accent2:#1f6feb;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Telugu",sans-serif;
+       background:var(--bg);color:var(--text);font-size:15px;line-height:1.4}
+  header{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);
+         padding:12px 14px;z-index:5}
+  h1{font-size:17px;margin:0 0 8px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  label{color:var(--muted);font-size:13px}
+  select{background:var(--card2);color:var(--text);border:1px solid var(--line);
+         border-radius:8px;padding:7px 8px;font-size:14px}
+  .wrap{padding:12px 14px;max-width:760px;margin:0 auto}
+  .filters{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
+  .fbox{display:flex;gap:8px;align-items:center;background:var(--card);
+        border:1px solid var(--line);border-radius:11px;padding:9px}
+  .fbox select{flex:0 0 38%;min-width:120px}
+  .fbox input[type=text]{flex:1;background:var(--card2);color:var(--text);
+        border:1px solid var(--line);border-radius:9px;padding:11px 12px;font-size:16px;min-width:0}
+  .fbox input:focus{outline:none;border-color:var(--accent)}
+  .meta{color:var(--muted);font-size:12px;margin:2px 2px 8px}
+  .results{display:flex;flex-direction:column;gap:8px}
+  .voter{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:10px 11px}
+  .name{font-size:16px;font-weight:600}
+  .sub{color:var(--muted);font-size:13px;margin-top:3px;display:flex;flex-wrap:wrap;gap:4px 12px}
+  .pill{background:#0d1018;border:1px solid var(--line);border-radius:6px;padding:1px 7px;font-size:12px;color:var(--muted)}
+  .epic{font-variant-numeric:tabular-nums;color:var(--accent)}
+  #loading{padding:24px 14px;text-align:center;color:var(--muted)}
+  .bar{height:8px;background:var(--card2);border-radius:6px;overflow:hidden;margin:12px auto;max-width:320px}
+  .bar > i{display:block;height:100%;width:0;background:var(--accent2);transition:width .15s}
+  .empty{color:var(--muted);font-size:13px;padding:4px 2px}
+  .seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .seg button{background:var(--card2);color:var(--muted);border:0;padding:6px 12px;font-size:13px}
+  .seg button.on{background:var(--accent2);color:#fff}
+</style>
+</head>
+<body>
+<header>
+  <h1>Voter Search</h1>
+  <div class="row">
+    <label for="count">Search boxes:</label>
+    <select id="count">
+      <option>1</option><option selected>2</option><option>3</option><option>4</option><option>5</option>
+      <option>6</option><option>7</option><option>8</option><option>9</option><option>10</option>
+    </select>
+    <label>Match:</label>
+    <div class="seg" id="mode">
+      <button data-m="AND" class="on">All (AND)</button>
+      <button data-m="OR">Any (OR)</button>
+    </div>
+    <span id="status" class="meta"></span>
+  </div>
+</header>
+
+<div id="loading">
+  <div>Loading voter database…</div>
+  <div class="bar"><i id="prog"></i></div>
+  <div id="loadnote" class="meta">First load downloads ~12MB once, then it is cached on your phone.</div>
+</div>
+
+<div class="wrap" id="app" style="display:none">
+  <div class="filters" id="filters"></div>
+  <div class="meta" id="resmeta"></div>
+  <div class="results" id="results"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<script>
+const DB_URL = "voters.db.gz";
+const IDB_NAME = "voterdb", IDB_KEY = "bytes_v1";
+const MAX_RESULTS = 200;
+
+// all columns, with labels for the dropdown
+const COLUMNS = [
+  {col:"voter_name",    label:"Voter Name"},
+  {col:"relation_name", label:"Relation Name"},
+  {col:"relation",      label:"Relation"},
+  {col:"epic_id",       label:"EPIC ID"},
+  {col:"door_no",       label:"Door No"},
+  {col:"part_no",       label:"Part No"},
+  {col:"sl_no",         label:"Sl No"},
+  {col:"age",           label:"Age"},
+  {col:"gender",        label:"Gender"},
+  {col:"ac",            label:"AC"},
+];
+const NUMERIC = new Set(["part_no","sl_no","age"]); // exact match for these
+let db = null;
+let mode = "AND";
+
+// ---------- IndexedDB cache ----------
+function idb(m,fn){return new Promise((res,rej)=>{const r=indexedDB.open(IDB_NAME,1);
+  r.onupgradeneeded=()=>r.result.createObjectStore("kv");r.onerror=()=>rej(r.error);
+  r.onsuccess=()=>{const tx=r.result.transaction("kv",m);const o=fn(tx.objectStore("kv"));
+  tx.oncomplete=()=>res(o&&o.result);tx.onerror=()=>rej(tx.error);};});}
+const cacheGet=()=>idb("readonly",s=>s.get(IDB_KEY));
+const cacheSet=b=>idb("readwrite",s=>s.put(b,IDB_KEY));
+
+async function fetchDbBytes(onProgress){
+  const resp = await fetch(DB_URL);
+  if(!resp.ok) throw new Error("Could not fetch "+DB_URL+" ("+resp.status+")");
+  const total=+(resp.headers.get("content-length")||0);
+  const reader = resp.body.pipeThrough(new DecompressionStream("gzip")).getReader();
+  const chunks=[];let got=0;
+  while(true){const {done,value}=await reader.read();if(done)break;
+    chunks.push(value);got+=value.length;
+    onProgress(total?Math.min(0.95,got/(total*4)):0.5);}
+  onProgress(1);
+  let len=chunks.reduce((a,c)=>a+c.length,0);const bytes=new Uint8Array(len);let off=0;
+  for(const c of chunks){bytes.set(c,off);off+=c.length;}return bytes;
+}
+
+async function boot(){
+  const prog=document.getElementById("prog");const setProg=p=>prog.style.width=Math.round(p*100)+"%";
+  try{
+    const SQL=await initSqlJs({locateFile:f=>"https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/"+f});
+    let bytes=await cacheGet();
+    if(!bytes){bytes=await fetchDbBytes(setProg);try{await cacheSet(bytes);}catch(e){}}
+    else{document.getElementById("loadnote").textContent="Loaded from cache.";setProg(1);}
+    db=new SQL.Database(bytes);
+    const n=db.exec("SELECT count(*) FROM voters")[0].values[0][0];
+    document.getElementById("status").textContent=n.toLocaleString()+" voters";
+    document.getElementById("loading").style.display="none";
+    document.getElementById("app").style.display="";
+    renderFilters();
+  }catch(err){
+    document.getElementById("loading").innerHTML='<div style="color:#f85149">Failed to load database.<br>'+err.message+'</div>';
+  }
+}
+
+// ---------- combined search across all boxes ----------
+function runSearch(){
+  const boxes=[...document.querySelectorAll(".fbox")];
+  const active=boxes.map(b=>({col:b.querySelector("select").value,
+                              val:b.querySelector("input").value.trim()}))
+                    .filter(f=>f.val!=="");
+  const resmeta=document.getElementById("resmeta");
+  const out=document.getElementById("results");
+  if(!active.length){resmeta.textContent="";out.innerHTML="";return;}
+
+  const conds=[],binds={};
+  active.forEach((f,i)=>{const k="$p"+i;
+    if(NUMERIC.has(f.col)){conds.push(f.col+" = "+k);binds[k]=f.val;}
+    else{conds.push(f.col+" LIKE "+k);binds[k]="%"+f.val+"%";}});
+  const where=conds.join(mode==="OR"?" OR ":" AND ");
+  const sql=`SELECT part_no,sl_no,door_no,voter_name,relation,relation_name,gender,age,epic_id
+             FROM voters WHERE ${where} LIMIT ${MAX_RESULTS+1}`;
+  const t0=performance.now();
+  const st=db.prepare(sql);st.bind(binds);
+  const rows=[];while(st.step())rows.push(st.getAsObject());st.free();
+  const more=rows.length>MAX_RESULTS;const show=rows.slice(0,MAX_RESULTS);
+  resmeta.textContent=show.length
+    ?`${more?MAX_RESULTS+"+":show.length} match${show.length>1?"es":""} · ${Math.round(performance.now()-t0)}ms · ${mode}`
+    :"No matches";
+  out.innerHTML=show.length?show.map(voterCard).join("")
+                           :'<div class="empty">No voters match all the filters.</div>';
+}
+
+function voterCard(v){
+  const g=v.gender==="పు"?"M":(v.gender==="స్త్రీ"||v.gender==="మ")?"F":(v.gender||"");
+  return `<div class="voter">
+    <div class="name">${esc(v.voter_name)}</div>
+    <div class="sub"><span>${esc(v.relation||"")} ${esc(v.relation_name||"")}</span></div>
+    <div class="sub">
+      <span class="pill">Part ${esc(v.part_no)}</span>
+      <span class="pill">Sl ${esc(v.sl_no)}</span>
+      <span class="pill">Age ${esc(v.age)}</span>
+      <span class="pill">${esc(g)}</span>
+      <span class="epic">${esc(v.epic_id||"")}</span>
+    </div></div>`;
+}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));}
+function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
+const debouncedSearch=debounce(runSearch,220);
+
+// ---------- build the filter boxes ----------
+function colSelect(defaultCol){
+  return `<select>`+COLUMNS.map(c=>
+    `<option value="${c.col}" ${c.col===defaultCol?"selected":""}>${c.label}</option>`).join("")+`</select>`;
+}
+function renderFilters(){
+  const count=+document.getElementById("count").value;
+  const box=document.getElementById("filters");
+  // keep existing values where possible
+  const prev=[...box.querySelectorAll(".fbox")].map(b=>({
+    col:b.querySelector("select").value, val:b.querySelector("input").value}));
+  box.innerHTML="";
+  for(let i=0;i<count;i++){
+    const def=prev[i]?prev[i].col:(COLUMNS[i]?COLUMNS[i].col:"voter_name");
+    const el=document.createElement("div");el.className="fbox";
+    el.innerHTML=colSelect(def)+
+      `<input type="text" placeholder="Search…" inputmode="search" />`;
+    if(prev[i])el.querySelector("input").value=prev[i].val;
+    el.querySelector("input").addEventListener("input",debouncedSearch);
+    el.querySelector("select").addEventListener("change",runSearch);
+    box.appendChild(el);
+  }
+  runSearch();
+}
+
+document.getElementById("count").addEventListener("change",renderFilters);
+document.querySelectorAll("#mode button").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll("#mode button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on");mode=b.dataset.m;runSearch();
+}));
+
+boot();
+</script>
+</body>
+</html>
